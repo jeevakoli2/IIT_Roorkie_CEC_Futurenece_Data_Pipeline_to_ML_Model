@@ -66,7 +66,7 @@ Row-level detail lives in `etl_quarantine` / `mart_rejected_rows` (critical) and
 
 ## Business questions (results from both pipelines, September)
 
-| # | Query on final tables | Result (ETL = ELT) |
+| # | Query on the ELT mart tables | Result (identical from the ETL tables, see below) |
 |---|---|---|
 | 1 | `SELECT order_date, zone, sum(net_revenue) FROM mart_daily_store_kpis GROUP BY 1,2` (store level: same table) | East 273,415.95 · West 270,878.60 · South 226,467.30 · North 215,968.05 · Unknown (S07) 73,818.05 |
 | 2 | `SELECT * FROM mart_category_margin` | Staples 246,178.95 rev / 62,198.41 margin (25.27%) · Personal Care 199,390.50 / 44,226.77 · Household 198,202.35 / 50,848.09 · Dairy & Bakery 167,733.65 / 44,415.46 · Snacks & Bev. 161,761.95 / 37,692.95 · Fruit & Veg 87,280.55 / 20,909.46 |
@@ -74,6 +74,51 @@ Row-level detail lives in `etl_quarantine` / `mart_rejected_rows` (critical) and
 | 4 | `mart_revenue_by_payment_mode`; `SELECT sum(unreconciled_amount) FROM mart_payment_reconciliation` | UPI 580,448.90 · Card 213,759.95 · COD 151,262.40 · Wallet 115,076.70. Unreconciled **₹208,315.80**, of which ₹160,134.63 is payments for orders *we* rejected; **₹48,181.17 is true mismatch** (missing payment 17,193.35; failed 25,722.25; amount 685.00; orphan 4,580.57) |
 | 5 | `SELECT * FROM mart_top_customers` | #1 C00136 ₹8,738.10 (`sa***@example.com`, Bronze), #2 C00310 ₹7,258.95, #3 C00236 ₹7,016.40 (Platinum) |
 | 6 | `SELECT source_file, failure_reason, count(*) FROM mart_rejected_rows GROUP BY 1,2` | 280 rows rejected → 297 (row, reason) pairs; top reason `orders.product_fk` 135 |
+
+### The same six questions from the ETL tables
+
+The ELT queries are in the table above. These are the ETL versions, run on `etl_fact_orders` and the `etl_dim_*` tables. I compared every result set against the ELT mart output and they are identical (Q1: 444 rows, Q2: 6 categories, Q3: 15 stores, Q4: 4 payment modes plus the unreconciled total, Q5: 10 customers, Q6: 23 file/reason pairs).
+
+```sql
+-- Q1 daily net revenue by zone and store
+SELECT f.order_date, s.zone, s.store_id, round(sum(f.net_revenue), 2) AS net_revenue
+FROM etl_fact_orders f JOIN etl_dim_store s USING (store_id)
+WHERE f.order_status = 'DELIVERED' GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+
+-- Q2 revenue and gross margin by category
+SELECT * FROM etl_category_margin;
+
+-- Q3 average delivery time and % delivered within 15 minutes, per store
+SELECT s.store_id, round(avg(f.delivery_minutes), 2) AS avg_delivery_minutes,
+       round(100.0 * avg(CAST(f.within_15_min AS INTEGER)), 2) AS pct_within_15_min
+FROM etl_fact_orders f JOIN etl_dim_store s USING (store_id)
+WHERE f.order_status = 'DELIVERED' GROUP BY 1 ORDER BY 1;
+
+-- Q4 revenue by payment mode, and the amount that does not reconcile
+SELECT payment_mode, round(sum(net_revenue), 2) AS net_revenue
+FROM etl_fact_orders WHERE order_status = 'DELIVERED' GROUP BY 1 ORDER BY 2 DESC;
+SELECT round(sum(unreconciled_amount), 2) AS unreconciled FROM etl_payment_reconciliation;
+
+-- Q5 top 10 customers by spend (masked contact details only)
+SELECT f.customer_id, c.email_masked, c.loyalty_tier, round(sum(f.net_revenue), 2) AS total_spend
+FROM etl_fact_orders f JOIN etl_dim_customer c USING (customer_id)
+WHERE f.order_status = 'DELIVERED' GROUP BY 1, 2, 3 ORDER BY total_spend DESC, 1 LIMIT 10;
+
+-- Q6 rows rejected, by file and reason
+SELECT source_file, failure_reason, count(*) AS rows_rejected
+FROM etl_quarantine GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+Results from the ETL tables (same as ELT):
+
+| # | Result |
+|---|---|
+| 1 | East 273,415.95 / West 270,878.60 / South 226,467.30 / North 215,968.05 / Unknown (store S07) 73,818.05 |
+| 2 | Staples 246,178.95 (margin 62,198.41, 25.27%), Personal Care 199,390.50 (44,226.77, 22.18%), Household 198,202.35 (50,848.09, 25.65%), Dairy & Bakery 167,733.65 (44,415.46, 26.48%), Snacks & Beverages 161,761.95 (37,692.95, 23.30%), Fruits & Vegetables 87,280.55 (20,909.46, 23.96%) |
+| 3 | mean of store averages 21.54 minutes; 28.13% of delivered orders within 15 minutes (per-store values: 15 rows) |
+| 4 | UPI 580,448.90 / Card 213,759.95 / Cash on Delivery 151,262.40 / Wallet 115,076.70; unreconciled 208,315.80 |
+| 5 | C00136 8,738.10; C00310 7,258.95; C00236 7,016.40; C00338 6,848.55; C00283 6,766.40; C00209 6,519.40; C00036 6,466.50; C00072 6,433.95; C00265 6,330.50; C00135 6,322.10 |
+| 6 | 280 rejected rows, 297 (row, reason) pairs; the largest is `orders.product_fk` with 135 |
 
 ## Part E — Governance
 
@@ -147,6 +192,12 @@ I recommend ELT, with Finance reading only from the mart tables.
 
 ---
 
-## Still to do (not done by the build) — see the end of the hand-over message
+## Evidence (in `evidence/`)
 
-Screenshots from your Astro UI; Slack alert / SCD2 / capacity check / DQ trend chart (bonus) not built; push to GitHub.
+- `screenshots/nammamart_etl_jay-graph.png`, `screenshots/nammamart_elt_jay-graph.png`: Graph view of both DAGs, green run
+- `screenshots/schedule_etl_9am_ist.png`, `screenshots/schedule_elt_9am_ist.png`: schedule `0 9 * * 1-6`, latest run 09:00, next run 09:00 (IST)
+- `screenshots/quarantine_orders_file.png` and `quarantine_orders_sample.csv`: rejected orders with the reason
+- `screenshots/results_1_pipeline_runs_dq_results.png`, `results_2_dq_results.png`, `results_3_reconciliation_revenue.png`: `pipeline_runs`, `dq_results`, payment reconciliation and the revenue check (ETL and ELT both 1,060,547.95)
+- `pipeline_runs.txt`, `dq_results_latest_runs.txt`, `results_runs_reconciliation_revenue.txt`: the same results as text
+
+Not built (optional bonus items): Slack alert on failure, SCD Type 2 customer dimension, store-capacity check, data-quality trend chart.
